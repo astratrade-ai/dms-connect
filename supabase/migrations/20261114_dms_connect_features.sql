@@ -159,3 +159,11 @@ with check (
    where cm.conversation_id=call_sessions.conversation_id
      and cm.user_id=call_sessions.callee_id)
 );
+
+drop policy if exists "users create own receipts" on public.conversation_reads;
+create policy "users create own receipts" on public.conversation_reads
+for insert to authenticated
+with check (
+ conversation_reads.user_id=(select auth.uid())
+ and private.is_conversation_member(conversation_reads.conversation_id)
+);
