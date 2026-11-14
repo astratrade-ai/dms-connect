@@ -127,3 +127,35 @@ grant select,insert,update,delete on public.push_subscriptions to authenticated;
 drop policy if exists "users manage own push subscriptions" on public.push_subscriptions;
 create policy "users manage own push subscriptions" on public.push_subscriptions for all to authenticated
 using(user_id=(select auth.uid())) with check(user_id=(select auth.uid()));
+
+-- Harden creator/admin membership checks with fully-qualified outer-row references.
+create or replace function private.is_conversation_admin(p_conversation_id uuid)
+returns boolean language sql stable security definer set search_path=pg_catalog
+as $$
+ select exists(select 1 from public.conversation_members cm
+   where cm.conversation_id=p_conversation_id
+     and cm.user_id=(select auth.uid())
+     and cm.member_role in ('owner','admin'));
+$$;
+revoke all on function private.is_conversation_admin(uuid) from public,anon;
+grant execute on function private.is_conversation_admin(uuid) to authenticated;
+
+drop policy if exists "conversation creator adds members" on public.conversation_members;
+create policy "conversation creator adds members" on public.conversation_members
+for insert to authenticated
+with check (
+ exists(select 1 from public.conversations c
+   where c.id=conversation_members.conversation_id and c.created_by=(select auth.uid()))
+ or private.is_conversation_admin(conversation_members.conversation_id)
+);
+
+drop policy if exists "members initiate calls" on public.call_sessions;
+create policy "members initiate calls" on public.call_sessions
+for insert to authenticated
+with check (
+ call_sessions.caller_id=(select auth.uid())
+ and private.is_conversation_member(call_sessions.conversation_id)
+ and exists(select 1 from public.conversation_members cm
+   where cm.conversation_id=call_sessions.conversation_id
+     and cm.user_id=call_sessions.callee_id)
+);
