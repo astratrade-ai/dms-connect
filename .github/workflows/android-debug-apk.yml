@@ -11,6 +11,7 @@ jobs:
     env:
       NEXT_PUBLIC_SUPABASE_URL: https://hoqdkxlqwnnyetidmjya.supabase.co
       NEXT_PUBLIC_SUPABASE_ANON_KEY: sb_publishable_4hGQ4xPcErTUXrwMbithvQ_xKQ_Hn2u
+      NEXT_PUBLIC_VAPID_PUBLIC_KEY: BK8GcMo99l2DEw46wm2V3oB17V5GKLeTNsAlBh3X1V6AXPSsMJEzxlgq1eqsH8l5OXXycz59puRKUflgWSjShRA
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
