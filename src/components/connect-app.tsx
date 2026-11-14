@@ -8,6 +8,15 @@ type Profile = { id: string; username: string | null; display_name: string };
 type Conversation = { id: string; kind: "direct" | "group"; title: string | null; updated_at: string };
 type Message = { id: string; conversation_id: string; sender_id: string; body: string; created_at: string };
 
+function urlBase64ToUint8Array(base64String: string): Uint8Array {
+  const padding = "=".repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = typeof atob === "function" ? atob(base64) : "";
+  const output = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) output[i] = raw.charCodeAt(i);
+  return output;
+}
+
 export default function ConnectApp() {
   const supabase = useMemo(() => createClient(), []);
   const [user, setUser] = useState<User | null>(null);
