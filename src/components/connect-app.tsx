@@ -228,7 +228,9 @@ export default function ConnectApp() {
     if (!user || !activeId || !draft.trim()) return;
     const body = draft.trim(); setDraft("");
     const { error } = await supabase.from("messages").insert({ conversation_id: activeId, sender_id: user.id, body });
-    if (error) { setDraft(body); setNotice(error.message); }
+    if (error) { setDraft(body); setNotice(error.message); return; }
+    const { error: pushError } = await supabase.functions.invoke("send-push", { body: { conversation_id: activeId, message: body } });
+    if (pushError) console.info("Push notification sender is not configured yet:", pushError.message);
   }
 
   async function createGroup() {
