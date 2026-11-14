@@ -1,0 +1,4 @@
+{
+  "name": "DMS Connect", "short_name": "DMS", "start_url": "/", "display": "standalone",
+  "background_color": "#f7f8fc", "theme_color": "#3157d5", "description": "DMS Connect messaging app"
+}
