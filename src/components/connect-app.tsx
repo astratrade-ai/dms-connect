@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@/lib/supabase";
 import type { User } from "@supabase/supabase-js";
 
@@ -24,6 +24,15 @@ export default function ConnectApp() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
   const [search, setSearch] = useState("");
+  const [callId, setCallId] = useState<string | null>(null);
+  const [incomingCall, setIncomingCall] = useState<any>(null);
+  const [callStatus, setCallStatus] = useState("");
+  const [callType, setCallType] = useState<"audio" | "video">("audio");
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const peerRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const callChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => { setUser(data.user); setLoading(false); });
@@ -71,6 +80,122 @@ export default function ConnectApp() {
       }).subscribe();
     return () => { alive = false; supabase.removeChannel(channel); };
   }, [activeId, user, supabase]);
+
+  async function stopCall(updateStatus = true) {
+    const id = callId;
+    if (peerRef.current) { peerRef.current.onicecandidate = null; peerRef.current.close(); peerRef.current = null; }
+    localStreamRef.current?.getTracks().forEach(track => track.stop());
+    localStreamRef.current = null;
+    if (localVideoRef.current) localVideoRef.current.srcObject = null;
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+    if (id && updateStatus) {
+      await supabase.from("call_sessions").update({ status: "ended", ended_at: new Date().toISOString() }).eq("id", id);
+      const { data: session } = await supabase.from("call_sessions").select("caller_id,callee_id").eq("id", id).maybeSingle();
+      const recipient = session?.caller_id === user?.id ? session?.callee_id : session?.caller_id;
+      if (recipient) await supabase.from("call_signals").insert({ call_id: id, sender_id: user?.id, recipient_id: recipient, signal_type: "hangup", payload: {} });
+    }
+    setCallId(null); setIncomingCall(null); setCallStatus("");
+    if (callChannelRef.current) { await supabase.removeChannel(callChannelRef.current); callChannelRef.current = null; }
+  }
+
+  async function setupPeer(id: string, remoteId: string, type: "audio" | "video") {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: type === "video" });
+    localStreamRef.current = stream;
+    if (localVideoRef.current && type === "video") { localVideoRef.current.srcObject = stream; }
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+    peerRef.current = pc;
+    stream.getTracks().forEach(track => pc.addTrack(track, stream));
+    pc.ontrack = event => { if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0]; };
+    pc.onicecandidate = async event => {
+      if (event.candidate && user) await supabase.from("call_signals").insert({
+        call_id: id, sender_id: user.id, recipient_id: remoteId, signal_type: "ice", payload: event.candidate.toJSON()
+      });
+    };
+    const channel = supabase.channel("call-signal-" + id)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "call_signals", filter: "call_id=eq." + id }, async payload => {
+        const signal = payload.new as any;
+        if (signal.recipient_id !== user?.id || signal.sender_id === user?.id) return;
+        try {
+          if (signal.signal_type === "answer" && pc.signalingState === "have-local-offer") {
+            await pc.setRemoteDescription(new RTCSessionDescription(signal.payload));
+            setCallStatus("কল সংযুক্ত হয়েছে");
+          } else if (signal.signal_type === "ice" && signal.payload) {
+            await pc.addIceCandidate(new RTCIceCandidate(signal.payload));
+          } else if (signal.signal_type === "hangup" || signal.signal_type === "reject") {
+            await stopCall(false);
+            setNotice(signal.signal_type === "reject" ? "কলটি গ্রহণ করা হয়নি।" : "অপর পক্ষ কল শেষ করেছেন।");
+          }
+        } catch (err) { setNotice(err instanceof Error ? err.message : "কল সিগন্যাল প্রসেস করা যায়নি।"); }
+      }).subscribe();
+    callChannelRef.current = channel;
+    return pc;
+  }
+
+  async function startCall(type: "audio" | "video") {
+    if (!user || !active || active.kind !== "direct") { setNotice("ভয়েস/ভিডিও কল আপাতত শুধু ব্যক্তিগত চ্যাটে চালু।"); return; }
+    try {
+      const { data: members, error } = await supabase.from("conversation_members").select("user_id").eq("conversation_id", active.id);
+      if (error) throw error;
+      const remote = (members || []).find(m => m.user_id !== user.id)?.user_id;
+      if (!remote) throw new Error("অপর পক্ষের সদস্য পাওয়া যায়নি।");
+      const { data: session, error: createError } = await supabase.from("call_sessions")
+        .insert({ conversation_id: active.id, caller_id: user.id, callee_id: remote, call_type: type })
+        .select("id").single();
+      if (createError) throw createError;
+      setCallId(session.id); setCallType(type); setCallStatus("অপর পক্ষকে কল করা হচ্ছে…");
+      const pc = await setupPeer(session.id, remote, type);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const { error: signalError } = await supabase.from("call_signals").insert({
+        call_id: session.id, sender_id: user.id, recipient_id: remote, signal_type: "offer", payload: offer
+      });
+      if (signalError) throw signalError;
+    } catch (err) { await stopCall(false); setNotice(err instanceof Error ? err.message : "কল শুরু করা যায়নি।"); }
+  }
+
+  async function acceptCall() {
+    if (!incomingCall || !user) return;
+    try {
+      const { data: offer, error } = await supabase.from("call_signals").select("payload,sender_id")
+        .eq("call_id", incomingCall.id).eq("signal_type", "offer").order("created_at", { ascending: false }).limit(1).maybeSingle();
+      if (error || !offer) throw error || new Error("কলের অফার পাওয়া যায়নি। আবার চেষ্টা করুন।");
+      setCallId(incomingCall.id); setCallType(incomingCall.call_type); setCallStatus("কল সংযোগ করা হচ্ছে…");
+      const pc = await setupPeer(incomingCall.id, offer.sender_id, incomingCall.call_type);
+      await pc.setRemoteDescription(new RTCSessionDescription(offer.payload));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      const { error: answerError } = await supabase.from("call_signals").insert({
+        call_id: incomingCall.id, sender_id: user.id, recipient_id: offer.sender_id, signal_type: "answer", payload: answer
+      });
+      if (answerError) throw answerError;
+      await supabase.from("call_sessions").update({ status: "accepted" }).eq("id", incomingCall.id);
+      setIncomingCall(null); setCallStatus("কল সংযুক্ত হচ্ছে…");
+    } catch (err) { setNotice(err instanceof Error ? err.message : "কল গ্রহণ করা যায়নি।"); }
+  }
+
+  async function rejectCall() {
+    if (!incomingCall || !user) return;
+    await supabase.from("call_signals").insert({ call_id: incomingCall.id, sender_id: user.id, recipient_id: incomingCall.caller_id, signal_type: "reject", payload: {} });
+    await supabase.from("call_sessions").update({ status: "rejected", ended_at: new Date().toISOString() }).eq("id", incomingCall.id);
+    setIncomingCall(null);
+  }
+
+  async function enableNotifications() {
+    try {
+      if (!("serviceWorker" in navigator) || !("PushManager" in window)) throw new Error("এই ব্রাউজার/অ্যাপে Push Notification সমর্থিত নয়।");
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") throw new Error("নোটিফিকেশনের অনুমতি দেওয়া হয়নি।");
+      const registration = await navigator.serviceWorker.register("/sw.js");
+      const publicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
+      if (!publicKey) throw new Error("Push service এখনো server-side VAPID keys দিয়ে কনফিগার করা হয়নি।");
+      const subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(publicKey) });
+      const { error } = await supabase.from("push_subscriptions").upsert({
+        user_id: user?.id, endpoint: subscription.endpoint, subscription: subscription.toJSON()
+      }, { onConflict: "endpoint" });
+      if (error) throw error;
+      setNotice("এই ডিভাইসে নোটিফিকেশন সাবস্ক্রিপশন সংরক্ষিত হয়েছে।");
+    } catch (err) { setNotice(err instanceof Error ? err.message : "নোটিফিকেশন চালু করা যায়নি।"); }
+  }
 
   async function authenticate(e: FormEvent) {
     e.preventDefault(); setNotice("একটু অপেক্ষা করুন…");
@@ -170,9 +295,9 @@ export default function ConnectApp() {
       <small className="privacy">আপনার কথোপকথন অ্যাকাউন্টভিত্তিক RLS নীতিতে সুরক্ষিত।</small>
     </aside>
     <section className="panel">
-      <header><div><h2>{active?.title || (active ? "ব্যক্তিগত চ্যাট" : "স্বাগতম!")}</h2><p>{active ? "DMS Connect কথোপকথন" : "একটি চ্যাট নির্বাচন করুন"}</p></div>{active?.kind === "group" && <button onClick={invite}>সদস্য যোগ করুন</button>}</header>
+      <header><div><h2>{active?.title || (active ? "ব্যক্তিগত চ্যাট" : "স্বাগতম!")}</h2><p>{active ? "DMS Connect কথোপকথন" : "একটি চ্যাট নির্বাচন করুন"}</p></div><div className="header-actions">{active?.kind === "group" && <button onClick={invite}>সদস্য যোগ করুন</button>}{active?.kind === "direct" && <><button onClick={() => startCall("audio")}>☎ অডিও কল</button><button onClick={() => startCall("video")}>▣ ভিডিও কল</button></>}<button onClick={enableNotifications}>🔔 নোটিফিকেশন</button></div></header>
       <div className="messages">{active ? messages.map(m => <article key={m.id} className={m.sender_id === user.id ? "mine" : ""}><p>{m.body}</p><time>{new Date(m.created_at).toLocaleTimeString("bn-BD", { hour: "2-digit", minute: "2-digit" })}</time></article>) : <div className="empty"><div className="logo">D</div><h2>আপনার যোগাযোগের নতুন ঠিকানা</h2><p>ব্যক্তিগত চ্যাট বা গ্রুপ তৈরি করে শুরু করুন।</p></div>}</div>
-      {active && <form className="composer" onSubmit={sendMessage}><label className="attach">＋<input type="file" hidden accept="image/jpeg,image/png,image/webp,application/pdf,text/plain" onChange={e => attach(e.target.files?.[0])}/></label><input value={draft} onChange={e => setDraft(e.target.value)} maxLength={10000} placeholder="একটি মেসেজ লিখুন…"/><button className="primary" disabled={!draft.trim()}>পাঠান</button></form>}
+      {callId && <div className="call-panel"><b>{callStatus}</b><div className="video-grid"><video ref={remoteVideoRef} autoPlay playsInline/><video ref={localVideoRef} autoPlay muted playsInline/></div><button onClick={() => stopCall()}>কল শেষ করুন</button></div>}{incomingCall && <div className="incoming-call"><b>ইনকামিং {incomingCall.call_type === "video" ? "ভিডিও" : "অডিও"} কল</b><button onClick={acceptCall}>গ্রহণ</button><button onClick={rejectCall}>বাতিল</button></div>}{active && <form className="composer" onSubmit={sendMessage}><label className="attach">＋<input type="file" hidden accept="image/jpeg,image/png,image/webp,application/pdf,text/plain" onChange={e => attach(e.target.files?.[0])}/></label><input value={draft} onChange={e => setDraft(e.target.value)} maxLength={10000} placeholder="একটি মেসেজ লিখুন…"/><button className="primary" disabled={!draft.trim()}>পাঠান</button></form>}
       {notice && <p className="notice bottom">{notice}</p>}
       <footer>DMS Connect • Voice/video call and push notifications are not enabled in this build.</footer>
     </section>
